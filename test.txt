@@ -1,0 +1,168 @@
+#include <windows.h> // Windows API 头文件，提供进程操作相关函数
+#include <tlhelp32.h> // 用于获取进程信息（CreateToolhelp32Snapshot, Process32First, Process32Next）
+#include <vector> // 用于存储匹配的内存地址
+#include <iostream> // 用于输入输出
+#include <unordered_set> // 用于高效存储和查找匹配的内存地址
+
+using namespace std;
+
+// 获取目标进程的 PID（进程 ID）
+DWORD GetProcessID(const std::string& processName) {
+    PROCESSENTRY32 pe32; // 存储进程信息的结构体
+    pe32.dwSize = sizeof(PROCESSENTRY32); // 结构体大小，必须先初始化
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0); 
+    // 创建进程快照，TH32CS_SNAPPROCESS 代表获取所有进程信息
+
+    if (Process32First(hSnapshot, &pe32)) { // 获取第一个进程
+        do {
+            wstring wProcessName(processName.begin(), processName.end()); // 将字符串转换为宽字符字符串
+            if (wProcessName == pe32.szExeFile) { // 判断是否匹配目标进程名称
+                CloseHandle(hSnapshot); // 关闭快照句柄
+                return pe32.th32ProcessID; // 返回目标进程 ID
+            }
+        } while (Process32Next(hSnapshot, &pe32)); // 继续遍历所有进程
+    }
+
+    CloseHandle(hSnapshot); // 关闭快照句柄
+    return 0; // 未找到目标进程，返回 0
+}
+
+// 在进程的内存中查找目标数值，并返回匹配的内存地址列表
+std::vector<uintptr_t> ScanProcessMemory(HANDLE hProcess, int targetValue, const std::unordered_set<uintptr_t>& previousAddresses) {
+    std::vector<uintptr_t> addresses; // 存储匹配的内存地址
+    SYSTEM_INFO sysInfo; // 系统信息结构体
+    GetSystemInfo(&sysInfo); // 获取系统信息
+
+    uintptr_t startAddress = (uintptr_t)sysInfo.lpMinimumApplicationAddress; 
+    // 获取应用程序最小地址
+    uintptr_t endAddress = (uintptr_t)sysInfo.lpMaximumApplicationAddress; 
+    // 获取应用程序最大地址
+
+    MEMORY_BASIC_INFORMATION mbi; // 内存块信息结构体
+    for (uintptr_t addr = startAddress; addr < endAddress; addr += mbi.RegionSize) {
+        if (VirtualQueryEx(hProcess, (LPCVOID)addr, &mbi, sizeof(mbi))) { 
+            // 获取内存区域信息
+            if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE)) { 
+                // 只扫描已分配并且可读写的内存区域
+                std::vector<byte> buffer(mbi.RegionSize); // 创建缓存区，大小等于该区域大小
+                SIZE_T bytesRead; // 读取的字节数
+                if (ReadProcessMemory(hProcess, (LPCVOID)addr, buffer.data(), mbi.RegionSize, &bytesRead)) {
+                    // 读取目标进程的内存数据
+                    for (size_t i = 0; i < bytesRead - sizeof(int); i++) { 
+                        // 遍历读取的内存数据，寻找匹配的数值
+                        uintptr_t currentAddr = addr + i; // 计算当前地址
+                        if (*reinterpret_cast<int*>(&buffer[i]) == targetValue) { 
+                            // 如果找到匹配的数值
+                            if (previousAddresses.empty() || previousAddresses.count(currentAddr) > 0) { 
+                                // 如果是第一次扫描，直接添加
+                                // 如果是后续扫描，只添加前次已记录的地址
+                                addresses.push_back(currentAddr); 
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return addresses; // 返回匹配的内存地址列表
+}
+
+// 修改指定地址的内存数据
+bool ModifyMemory(HANDLE hProcess, uintptr_t address, int newValue) {
+    SIZE_T bytesWritten; // 记录写入的字节数
+    return WriteProcessMemory(hProcess, (LPVOID)address, &newValue, sizeof(newValue), &bytesWritten);
+    // 写入新的数值到目标地址
+}
+
+int main() {
+    std::string targetProcess = "Tutorial-x86_64.exe";  // 目标进程名称
+    int targetValue, newTargetValue, finalValue; // 目标值、变更后的值、最终修改值
+
+    std::cout << "请输入目标进程的初始数值: ";
+    std::cin >> targetValue; // 读取用户输入的目标值
+
+    DWORD pid = GetProcessID(targetProcess); // 获取目标进程的 PID
+    if (!pid) { // 如果进程 ID 为 0，说明未找到
+        std::cerr << "无法找到进程: " << targetProcess << std::endl;
+        return 1;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid); 
+    // 以最高权限打开目标进程
+    if (!hProcess) {
+        std::cerr << "无法打开进程，可能需要管理员权限。" << std::endl;
+        return 1;
+    }
+
+    std::unordered_set<uintptr_t> potentialAddresses; // 存储可能的地址
+    std::vector<uintptr_t> scanResults; // 存储扫描结果
+
+    // **第一次扫描**
+    scanResults = ScanProcessMemory(hProcess, targetValue, potentialAddresses);
+    if (scanResults.empty()) { // 如果未找到匹配的数值
+        std::cerr << "未找到目标数值" << std::endl;
+        CloseHandle(hProcess);
+        return 1;
+    }
+
+    // 将找到的地址存入集合，以便后续筛选
+    for (uintptr_t addr : scanResults) {
+        potentialAddresses.insert(addr);
+    }
+
+    std::cout << "找到 " << scanResults.size() << " 个可能的地址。请在目标进程中更改该值，然后按 Enter 继续扫描..." << std::endl;
+
+    // **第二次扫描**
+    std::cout << "请输入目标进程的新数值: ";
+    std::cin >> newTargetValue;
+
+    scanResults = ScanProcessMemory(hProcess, newTargetValue, potentialAddresses);
+    if (scanResults.empty()) {
+        std::cerr << "未找到目标数值，可能是修改太快或扫描间隔过长" << std::endl;
+        CloseHandle(hProcess);
+        return 1;
+    }
+
+    // 进一步缩小可能的地址范围
+    potentialAddresses.clear();
+    for (uintptr_t addr : scanResults) {
+        potentialAddresses.insert(addr);
+    }
+
+    std::cout << "锁定 " << scanResults.size() << " 个可能的地址。请再次修改数值，然后按 Enter 继续..." << std::endl;
+    system("pause"); // 等待用户确认
+
+    // **第三次扫描**
+    std::cout << "请输入目标进程的最终数值: ";
+    std::cin >> finalValue;
+
+    scanResults = ScanProcessMemory(hProcess, finalValue, potentialAddresses);
+    if (scanResults.empty()) {
+        std::cerr << "未找到目标数值" << std::endl;
+        CloseHandle(hProcess);
+        return 1;
+    }
+
+    std::cout << "成功锁定 " << scanResults.size() << " 个地址!" << std::endl;
+    for (uintptr_t addr : scanResults) {
+        std::cout << "锁定地址: 0x" << std::hex << addr << std::dec << std::endl;
+    }
+
+    // **修改最终锁定的地址**
+    std::cout << "请输入想要修改的数值: ";
+    int modifyValue;
+    std::cin >> modifyValue;
+
+    for (uintptr_t addr : scanResults) {
+        if (ModifyMemory(hProcess, addr, modifyValue)) { 
+            // 修改目标内存地址的数值
+            std::cout << "地址 0x" << std::hex << addr << " 修改成功!" << std::dec << std::endl;
+        } else {
+            std::cerr << "地址 0x" << std::hex << addr << " 修改失败!" << std::dec << std::endl;
+        }
+    }
+
+    CloseHandle(hProcess); // 关闭进程句柄
+    return 0;
+}
